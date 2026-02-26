@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# NIfTI atlas files (large binaries — download at setup time)
+atlas/*.nii.gz
+
+# Pipeline output directories
+*_out/
