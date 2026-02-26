@@ -11,6 +11,28 @@ Publication-ready pipeline for computing spinal cord and canal cross-sectional a
 | 3 | **Atlas41** | [`PAM50_atlas_41.nii.gz`](https://github.com/neuroradiologyVH/Spinal-Cord-Canal-Template) warped to native | TotalSpineSeg cord | Warped atlas (includes cord) | cord / (atlas41 - cord) | T1w, T2w, STIR |
 | 4 | **PAM50** | SCT built-in `PAM50_cord` + `PAM50_csf` warped to native | Warped PAM50_cord | Warped PAM50_cord + PAM50_csf union | cord / (union - cord) | T1w, T2w, STIR |
 
+### Segmentation label reference
+
+**TotalSpineSeg** (`sct_deepseg spine`, via SCT) — `_totalspineseg_all.nii.gz`:
+
+| Label | Structure |
+|-------|-----------|
+| 1 | Spinal cord |
+| 2 | Spinal canal (CSF only, does NOT include cord) |
+| 11–17 | Vertebral levels C1–C7 |
+| 21–32 | Vertebral levels T1–T12 |
+| 41–45 | Vertebral levels L1–L5 |
+| 50 | Sacrum (S1) |
+
+**SPINEPS** ([spineps](https://github.com/Hendrik-code/spineps)) — `_seg-spine_msk.nii.gz`:
+
+| Label | Structure |
+|-------|-----------|
+| 60 | Spinal cord |
+| 61 | Spinal canal (CSF only, does NOT include cord) |
+
+Both tools output cord and canal as separate labels. The pipeline parses these into individual binary masks using `process_seg.py` (TotalSpineSeg) and `process_spineps_seg.py` (SPINEPS), with Z-range intersection to ensure cord and canal occupy the same slices.
+
 ### Key differences between canal definitions
 
 - **Atlas41** (`PAM50_atlas_41`): A single template that represents the **full spinal canal** (cord + CSF). When warped and binarized, it directly gives the canal mask.
