@@ -12,7 +12,7 @@ from matplotlib.colors import ListedColormap
 # Method colors: cord = filled overlay, canal = bold contour
 METHOD_COLORS = {
     "totalspineseg": {"cord": "#e41a1c", "canal": "#ffff00"},  # red cord, yellow canal
-    "spineps":       {"cord": "#377eb8", "canal": "#00ffff"},  # blue cord, cyan canal
+    "spineps":       {"cord": "#377eb8", "canal": "#ffff00"},  # blue cord, yellow canal
     "custom-atlas":  {"cord": "#4daf4a", "canal": "#ffff00"},  # green cord, yellow canal
     "pam50":         {"cord": "#984ea3", "canal": "#ffff00"},  # purple cord, yellow canal
 }

@@ -48,7 +48,7 @@ def parse_method_directory(method_dir, info_column, measure_type):
         row = {"subject_id": subject_id, "session_id": session_id}
         for _, record in df.iterrows():
             level = int(record.get("VertLevel", record.get("vertLevel", -1)))
-            if level in (2, 3, 4):
+            if level > 0:
                 row[f"level{level}"] = record[info_column]
 
         rows.append(row)
@@ -57,8 +57,12 @@ def parse_method_directory(method_dir, info_column, measure_type):
         return pd.DataFrame()
 
     result = pd.DataFrame(rows)
-    # Ensure consistent column order
-    cols = ["subject_id", "session_id", "level2", "level3", "level4"]
+    # Dynamically discover all level columns and sort numerically
+    level_cols = sorted(
+        [c for c in result.columns if c.startswith("level")],
+        key=lambda x: int(x.replace("level", ""))
+    )
+    cols = ["subject_id", "session_id"] + level_cols
     for c in cols:
         if c not in result.columns:
             result[c] = ""

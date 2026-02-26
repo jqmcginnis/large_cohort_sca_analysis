@@ -16,13 +16,15 @@ def relabel_nifti(input_path, output_path):
     # 2. Define the mapping (Old Label -> New Label)
     # Everything else will implicitly become 0 (background)
     label_mapping = {
-        11: 1,
-        12: 2,
-        13: 3,
-        14: 4,
-        15: 5,
-        16: 6,
-        17: 7
+        # Cervical: TotalSpineSeg 11-17 → SCT 1-7
+        11: 1, 12: 2, 13: 3, 14: 4, 15: 5, 16: 6, 17: 7,
+        # Thoracic: TotalSpineSeg 21-32 → SCT 8-19
+        21: 8, 22: 9, 23: 10, 24: 11, 25: 12, 26: 13,
+        27: 14, 28: 15, 29: 16, 30: 17, 31: 18, 32: 19,
+        # Lumbar: TotalSpineSeg 41-45 → SCT 20-24
+        41: 20, 42: 21, 43: 22, 44: 23, 45: 24,
+        # Sacrum: TotalSpineSeg 50 → SCT 25
+        50: 25,
     }
     
     # 3. Create a new empty array of zeros with the same shape as the input
@@ -50,7 +52,7 @@ def relabel_nifti(input_path, output_path):
 
 if __name__ == "__main__":
     # Set up argument parsing
-    parser = argparse.ArgumentParser(description="Extract and relabel specific labels (11-17) from a NIfTI file.")
+    parser = argparse.ArgumentParser(description="Relabel TotalSpineSeg vertebral levels (C1-C7, T1-T12, L1-L5, S1) to SCT convention.")
     
     # Required argument: --label
     parser.add_argument("--mask", type=str, required=True, help="Path to the input segmentation/label file (nii or nii.gz)")
