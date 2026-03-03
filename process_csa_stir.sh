@@ -6,7 +6,7 @@
 #   1 — TotalSpineSeg  (cord + canal from DL segmentation)
 #   2 — SPINEPS        (cord + canal from DL segmentation, if installed)
 #   3 — Atlas41        (PAM50_atlas_41 = full canal template, warped to native space)
-#   4 — PAM50          (PAM50_cord + PAM50_csf warped to native space)
+#   4 — PAM50          (PAM50_cord+csf union warped to native; cord from TotalSpineSeg)
 #
 # Methods 3 & 4 run an interpolation ablation (nn, linear, spline) comparing
 # different warping strategies for probabilistic templates.
@@ -25,7 +25,7 @@
 #       so this script discovers the STIR file dynamically in each session.
 #
 # Dependencies:
-#   - SCT >= 7.2.0
+#   - SCT >= 7.1
 #   - SPINEPS (pip install spineps) — optional
 #   - Python packages: nibabel, numpy
 #
@@ -55,7 +55,7 @@ start=$(date +%s)
 sct_check_dependencies -short
 
 # PAM50 template directory (within SCT installation)
-PAM50_DIR="$(dirname "$(which sct_version)")/../data/PAM50"
+PAM50_DIR="${SCT_DIR}/data/PAM50"
 
 # Go to processing folder
 cd "${PATH_DATA_PROCESSED}"
@@ -67,7 +67,7 @@ file="${SUBJECT//[\/]/_}"
 cd "${SUBJECT}/anat/"
 
 # Dynamically discover the STIR file (naming varies across subjects)
-file_stir_nii=$(ls *_STIR.nii.gz 2>/dev/null | head -1)
+file_stir_nii=$(ls *_STIR.nii.gz 2>/dev/null | head -1) || true
 if [[ -z "${file_stir_nii}" ]]; then
     echo "WARNING: No STIR file found for ${SUBJECT}. Skipping."
     exit 0
@@ -78,11 +78,11 @@ echo "Found STIR file: ${file_stir}"
 # ======================================================================
 # Phase 1: TotalSpineSeg Segmentation (GPU — serial)
 # ======================================================================
-sct_deepseg spine -i "${file_stir}.nii.gz" -label-vert 1 -qc "${PATH_QC}"
+sct_deepseg totalspineseg -i "${file_stir}.nii.gz" -qc "${PATH_QC}"
 
-# Output products (standard SCT naming)
-file_totalseg_all="${file_stir}_totalspineseg_all"
-file_totalseg_discs="${file_stir}_totalspineseg_discs"
+# Output products (SCT 7.1 naming: step1_* and step2_*)
+file_totalseg_all="${file_stir}_step2_output"
+file_totalseg_discs="${file_stir}_step1_levels"
 
 # ======================================================================
 # Phase 2: Parse TotalSpineSeg Labels (parallel)
@@ -118,22 +118,27 @@ wait $pid_vert
 
     sct_process_segmentation -i "${file_tss_cord}.nii.gz" \
         -vertfile "${file_tss_vert}.nii.gz" \
-        -o "${PATH_RESULTS}/method-totalspineseg/${file}_cord.csv" -perlevel 1 &
+        -o "${PATH_RESULTS}/method-totalspineseg/${file}_cord.csv" -vert 1:25 -perlevel 1 &
     pid1=$!
 
     sct_process_segmentation -i "${file_tss_union}.nii.gz" \
         -vertfile "${file_tss_vert}.nii.gz" \
-        -o "${PATH_RESULTS}/method-totalspineseg/${file}_canal.csv" -perlevel 1 &
+        -o "${PATH_RESULTS}/method-totalspineseg/${file}_canal.csv" -vert 1:25 -perlevel 1 &
     pid2=$!
 
-    sct_compute_ascor -i-SC "${file_tss_cord}.nii.gz" -i-canal "${file_tss_canal}.nii.gz" \
+    sct_process_segmentation -i "${file_tss_canal}.nii.gz" \
         -vertfile "${file_tss_vert}.nii.gz" \
-        -o "${PATH_RESULTS}/method-totalspineseg/${file}_ratio.csv" -perlevel 1 &
+        -o "${file_tss_canal}_csa.csv" -vert 1:25 -perlevel 1 &
     pid3=$!
 
     wait $pid1
     wait $pid2
     wait $pid3
+
+    python3 "${SCRIPT_DIR}/compute_ascor.py" \
+        --cord-csa "${PATH_RESULTS}/method-totalspineseg/${file}_cord.csv" \
+        --canal-csa "${file_tss_canal}_csa.csv" \
+        -o "${PATH_RESULTS}/method-totalspineseg/${file}_ratio.csv"
 ) &
 pid_branch_a=$!
 
@@ -158,61 +163,71 @@ pid_branch_a=$!
         -x nn \
         -o PAM50_levels_warped_nn.nii.gz
 
+    # Pre-combine cord+CSF in template space (binary union) so that a single
+    # warp preserves boundary voxels. Warping separately and combining in
+    # native space loses voxels where cord=0.4 + csf=0.4 = 0.8 canal
+    # probability — both get zeroed by independent 0.5 thresholds.
+    sct_maths -i "${PAM50_DIR}/template/PAM50_cord.nii.gz" \
+        -add "${PAM50_DIR}/template/PAM50_csf.nii.gz" \
+        -o PAM50_cord_csf_union_template.nii.gz
+    sct_maths -i PAM50_cord_csf_union_template.nii.gz -bin 0.5 \
+        -o PAM50_cord_csf_union_template.nii.gz
+
     # --- 3 interpolation variants in parallel ---
     interp_pids=()
     for INTERP in nn linear spline; do
         (
             echo ">>> Warping templates with interpolation: ${INTERP}"
 
-            # Warp 3 templates in parallel
-            sct_apply_transfo -i "${PAM50_DIR}/template/PAM50_cord.nii.gz" \
+            # Warp 2 templates in parallel: cord+csf union, atlas41
+            # No need to warp PAM50_cord — we use TotalSpineSeg cord (native space)
+            sct_apply_transfo -i PAM50_cord_csf_union_template.nii.gz \
                 -d "${file_stir}.nii.gz" \
                 -w warp_template2anat.nii.gz \
                 -x "${INTERP}" \
-                -o "PAM50_cord_warped_${INTERP}.nii.gz" &
+                -o "PAM50_canal_warped_${INTERP}.nii.gz" &
             pid_w1=$!
-
-            sct_apply_transfo -i "${PAM50_DIR}/template/PAM50_csf.nii.gz" \
-                -d "${file_stir}.nii.gz" \
-                -w warp_template2anat.nii.gz \
-                -x "${INTERP}" \
-                -o "PAM50_csf_warped_${INTERP}.nii.gz" &
-            pid_w2=$!
 
             sct_apply_transfo -i "${SCRIPT_DIR}/atlas/PAM50_atlas_41.nii.gz" \
                 -d "${file_stir}.nii.gz" \
                 -w warp_template2anat.nii.gz \
                 -x "${INTERP}" \
                 -o "PAM50_atlas41_warped_${INTERP}.nii.gz" &
-            pid_w3=$!
+            pid_w2=$!
 
             wait $pid_w1
             wait $pid_w2
-            wait $pid_w3
 
             # Binarize warped templates in parallel
-            sct_maths -i "PAM50_cord_warped_${INTERP}.nii.gz" -bin 0.5 \
-                -o "PAM50_cord_warped_${INTERP}_bin.nii.gz" &
+            sct_maths -i "PAM50_canal_warped_${INTERP}.nii.gz" -bin 0.5 \
+                -o "PAM50_canal_warped_${INTERP}_bin.nii.gz" &
             pid_b1=$!
-
-            sct_maths -i "PAM50_csf_warped_${INTERP}.nii.gz" -bin 0.5 \
-                -o "PAM50_csf_warped_${INTERP}_bin.nii.gz" &
-            pid_b2=$!
 
             sct_maths -i "PAM50_atlas41_warped_${INTERP}.nii.gz" -bin 0.5 \
                 -o "PAM50_atlas41_warped_${INTERP}_bin.nii.gz" &
-            pid_b3=$!
+            pid_b2=$!
 
             wait $pid_b1
             wait $pid_b2
-            wait $pid_b3
 
-            # PAM50 canal = cord + CSF union (sequential — needs cord_bin + csf_bin)
-            sct_maths -i "PAM50_cord_warped_${INTERP}_bin.nii.gz" \
-                -add "PAM50_csf_warped_${INTERP}_bin.nii.gz" \
-                -o "PAM50_canal_warped_${INTERP}_union.nii.gz"
-            sct_maths -i "PAM50_canal_warped_${INTERP}_union.nii.gz" -bin 0.5 \
+            # Post-process canal mask:
+            # 1. Ensure canal ⊇ cord (warping can lose boundary voxels)
+            # 2. Fill holes (spline interpolation creates gaps in the CSF ring)
+            # Both are needed for clean QC contours and correct aSCOR.
+            sct_maths -i "PAM50_canal_warped_${INTERP}_bin.nii.gz" \
+                -add "${file_tss_cord}.nii.gz" \
                 -o "PAM50_canal_warped_${INTERP}_bin.nii.gz"
+            sct_maths -i "PAM50_canal_warped_${INTERP}_bin.nii.gz" -bin 0.5 \
+                -o "PAM50_canal_warped_${INTERP}_bin.nii.gz"
+            python3 -c "
+import nibabel as nib, numpy as np
+from scipy.ndimage import binary_fill_holes
+img = nib.load('PAM50_canal_warped_${INTERP}_bin.nii.gz')
+d = img.get_fdata()
+for z in range(d.shape[2]):
+    d[:,:,z] = binary_fill_holes(d[:,:,z])
+nib.save(nib.Nifti1Image(d.astype(np.float32), img.affine, img.header), 'PAM50_canal_warped_${INTERP}_bin.nii.gz')
+"
 
             # Create result directories
             mkdir -p "${PATH_RESULTS}/method-atlas41-warp-${INTERP}"
@@ -223,12 +238,12 @@ pid_branch_a=$!
                 # Method 3: Atlas41 — CSA + aSCOR
                 sct_process_segmentation -i "PAM50_atlas41_warped_${INTERP}_bin.nii.gz" \
                     -vertfile PAM50_levels_warped_nn.nii.gz \
-                    -o "${PATH_RESULTS}/method-atlas41-warp-${INTERP}/${file}_canal.csv" -perlevel 1 &
+                    -o "${PATH_RESULTS}/method-atlas41-warp-${INTERP}/${file}_canal.csv" -vert 1:25 -perlevel 1 &
                 pid_c1=$!
 
                 sct_process_segmentation -i "${file_tss_cord}.nii.gz" \
                     -vertfile PAM50_levels_warped_nn.nii.gz \
-                    -o "${PATH_RESULTS}/method-atlas41-warp-${INTERP}/${file}_cord.csv" -perlevel 1 &
+                    -o "${PATH_RESULTS}/method-atlas41-warp-${INTERP}/${file}_cord.csv" -vert 1:25 -perlevel 1 &
                 pid_c2=$!
 
                 {
@@ -237,29 +252,34 @@ pid_branch_a=$!
                         -o "PAM50_atlas41_canal_only_${INTERP}.nii.gz"
                     sct_maths -i "PAM50_atlas41_canal_only_${INTERP}.nii.gz" -bin 0.5 \
                         -o "PAM50_atlas41_canal_only_${INTERP}_bin.nii.gz"
-                    sct_compute_ascor -i-SC "${file_tss_cord}.nii.gz" \
-                        -i-canal "PAM50_atlas41_canal_only_${INTERP}_bin.nii.gz" \
+                    sct_process_segmentation -i "PAM50_atlas41_canal_only_${INTERP}_bin.nii.gz" \
                         -vertfile PAM50_levels_warped_nn.nii.gz \
-                        -o "${PATH_RESULTS}/method-atlas41-warp-${INTERP}/${file}_ratio.csv" -perlevel 1
+                        -o "atlas41_canal_only_${INTERP}_csa.csv" -vert 1:25 -perlevel 1
                 } &
                 pid_c3=$!
 
                 wait $pid_c1
                 wait $pid_c2
                 wait $pid_c3
+
+                python3 "${SCRIPT_DIR}/compute_ascor.py" \
+                    --cord-csa "${PATH_RESULTS}/method-atlas41-warp-${INTERP}/${file}_cord.csv" \
+                    --canal-csa "atlas41_canal_only_${INTERP}_csa.csv" \
+                    -o "${PATH_RESULTS}/method-atlas41-warp-${INTERP}/${file}_ratio.csv"
             ) &
             pid_m3=$!
 
             (
                 # Method 4: PAM50 — CSA + aSCOR
+                # Cord CSA uses TotalSpineSeg cord (native) — no need for warped PAM50 cord
                 sct_process_segmentation -i "PAM50_canal_warped_${INTERP}_bin.nii.gz" \
                     -vertfile PAM50_levels_warped_nn.nii.gz \
-                    -o "${PATH_RESULTS}/method-pam50-warp-${INTERP}/${file}_canal.csv" -perlevel 1 &
+                    -o "${PATH_RESULTS}/method-pam50-warp-${INTERP}/${file}_canal.csv" -vert 1:25 -perlevel 1 &
                 pid_c1=$!
 
-                sct_process_segmentation -i "PAM50_cord_warped_${INTERP}_bin.nii.gz" \
+                sct_process_segmentation -i "${file_tss_cord}.nii.gz" \
                     -vertfile PAM50_levels_warped_nn.nii.gz \
-                    -o "${PATH_RESULTS}/method-pam50-warp-${INTERP}/${file}_cord.csv" -perlevel 1 &
+                    -o "${PATH_RESULTS}/method-pam50-warp-${INTERP}/${file}_cord.csv" -vert 1:25 -perlevel 1 &
                 pid_c2=$!
 
                 {
@@ -268,16 +288,20 @@ pid_branch_a=$!
                         -o "PAM50_canal_only_warped_${INTERP}.nii.gz"
                     sct_maths -i "PAM50_canal_only_warped_${INTERP}.nii.gz" -bin 0.5 \
                         -o "PAM50_canal_only_warped_${INTERP}_bin.nii.gz"
-                    sct_compute_ascor -i-SC "${file_tss_cord}.nii.gz" \
-                        -i-canal "PAM50_canal_only_warped_${INTERP}_bin.nii.gz" \
+                    sct_process_segmentation -i "PAM50_canal_only_warped_${INTERP}_bin.nii.gz" \
                         -vertfile PAM50_levels_warped_nn.nii.gz \
-                        -o "${PATH_RESULTS}/method-pam50-warp-${INTERP}/${file}_ratio.csv" -perlevel 1
+                        -o "pam50_canal_only_${INTERP}_csa.csv" -vert 1:25 -perlevel 1
                 } &
                 pid_c3=$!
 
                 wait $pid_c1
                 wait $pid_c2
                 wait $pid_c3
+
+                python3 "${SCRIPT_DIR}/compute_ascor.py" \
+                    --cord-csa "${PATH_RESULTS}/method-pam50-warp-${INTERP}/${file}_cord.csv" \
+                    --canal-csa "pam50_canal_only_${INTERP}_csa.csv" \
+                    -o "${PATH_RESULTS}/method-pam50-warp-${INTERP}/${file}_ratio.csv"
             ) &
             pid_m4=$!
 
@@ -293,7 +317,9 @@ pid_branch_a=$!
 pid_branch_b=$!
 
 # --- Branch C: SPINEPS (GPU + CPU) ---
+# SPINEPS is optional — failures must not kill the main pipeline
 (
+    set +e
     SPINEPS_AVAILABLE=false
     if [[ -d "${HOME}/anaconda3/envs/spineps" ]]; then
         SPINEPS_AVAILABLE=true
@@ -311,16 +337,16 @@ pid_branch_b=$!
         # SPINEPS rejects filenames containing "STIR" — create a T2-named symlink
         file_stir_spineps_input="${file_stir/_STIR/_T2}"
         ln -sf "${file_stir}.nii.gz" "${file_stir_spineps_input}.nii.gz"
-        spineps sample -i "${file_stir_spineps_input}.nii.gz" -model_semantic t2w -model_instance instance
+        spineps sample -ignore_bids_filter -ignore_inference_compatibility -i "${file_stir_spineps_input}.nii.gz" -model_semantic t2w -model_instance instance
 
         # Deactivate back to base environment for SCT compatibility
         if [[ -n "${CONDA_DEFAULT_ENV}" && "${CONDA_DEFAULT_ENV}" == "spineps" ]]; then
             conda deactivate
         fi
 
-        # SPINEPS outputs to derivatives_seg/ with _mod-T2 naming (uses symlinked T2 name)
-        spineps_base="$(basename "${file_stir_spineps_input}")"
-        file_spineps_spine="$(dirname "${file_stir_spineps_input}")/derivatives_seg/${spineps_base%_T2}_mod-T2_seg-spine_msk"
+        # SPINEPS outputs to derivatives_seg/ — entity order varies, so glob for it
+        file_spineps_spine=$(ls "$(dirname "${file_stir_spineps_input}")"/derivatives_seg/*_seg-spine*msk.nii.gz 2>/dev/null | head -1)
+        file_spineps_spine="${file_spineps_spine%.nii.gz}"
         file_spi_cord="${file_stir}_seg-spineps-cord"
         file_spi_canal="${file_stir}_seg-spineps-canal"
         file_spi_union="${file_stir}_seg-spineps-cord-canal-union"
@@ -335,22 +361,27 @@ pid_branch_b=$!
 
         sct_process_segmentation -i "${file_spi_cord}.nii.gz" \
             -vertfile "${file_tss_vert}.nii.gz" \
-            -o "${PATH_RESULTS}/method-spineps/${file}_cord.csv" -perlevel 1 &
+            -o "${PATH_RESULTS}/method-spineps/${file}_cord.csv" -vert 1:25 -perlevel 1 &
         pid_s1=$!
 
         sct_process_segmentation -i "${file_spi_union}.nii.gz" \
             -vertfile "${file_tss_vert}.nii.gz" \
-            -o "${PATH_RESULTS}/method-spineps/${file}_canal.csv" -perlevel 1 &
+            -o "${PATH_RESULTS}/method-spineps/${file}_canal.csv" -vert 1:25 -perlevel 1 &
         pid_s2=$!
 
-        sct_compute_ascor -i-SC "${file_spi_cord}.nii.gz" -i-canal "${file_spi_canal}.nii.gz" \
+        sct_process_segmentation -i "${file_spi_canal}.nii.gz" \
             -vertfile "${file_tss_vert}.nii.gz" \
-            -o "${PATH_RESULTS}/method-spineps/${file}_ratio.csv" -perlevel 1 &
+            -o "${file_spi_canal}_csa.csv" -vert 1:25 -perlevel 1 &
         pid_s3=$!
 
         wait $pid_s1
         wait $pid_s2
         wait $pid_s3
+
+        python3 "${SCRIPT_DIR}/compute_ascor.py" \
+            --cord-csa "${PATH_RESULTS}/method-spineps/${file}_cord.csv" \
+            --canal-csa "${file_spi_canal}_csa.csv" \
+            -o "${PATH_RESULTS}/method-spineps/${file}_ratio.csv"
     else
         echo "WARNING: spineps not found. Skipping Method 2 (SPINEPS)."
     fi
@@ -360,7 +391,7 @@ pid_branch_c=$!
 # Wait for all parallel branches to complete
 wait $pid_branch_a
 wait $pid_branch_b
-wait $pid_branch_c
+wait $pid_branch_c || echo "WARNING: SPINEPS branch failed (non-critical). Continuing."
 
 # ======================================================================
 # QC: Custom overlay comparing all methods (uses spline = best quality)
@@ -384,7 +415,7 @@ python3 "${SCRIPT_DIR}/generate_qc.py" \
     --totalspineseg-canal "${file_tss_union}.nii.gz" \
     --custom-atlas-cord "${file_tss_cord}.nii.gz" \
     --custom-atlas-canal "PAM50_atlas41_warped_spline_bin.nii.gz" \
-    --pam50-cord "PAM50_cord_warped_spline_bin.nii.gz" \
+    --pam50-cord "${file_tss_cord}.nii.gz" \
     --pam50-canal "PAM50_canal_warped_spline_bin.nii.gz" \
     ${SPINEPS_QC_ARGS} \
     -o "${PATH_QC}/custom_overlays/${file}_qc.png" \

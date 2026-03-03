@@ -211,3 +211,6 @@ atlas/*.nii.gz
 
 # Pipeline output directories
 *_out/
+
+# Test include lists
+include_test_*.txt

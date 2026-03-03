@@ -109,7 +109,8 @@ def main():
         print(f"\nProcessing: {method}")
 
         for measure_type in ("cord", "canal", "ratio"):
-            df = parse_method_directory(method_path, info_column, measure_type)
+            col = "aSCOR" if measure_type == "ratio" else info_column
+            df = parse_method_directory(method_path, col, measure_type)
             if df.empty:
                 continue
 

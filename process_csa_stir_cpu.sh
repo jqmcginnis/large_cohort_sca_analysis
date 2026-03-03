@@ -1,38 +1,24 @@
 #!/bin/bash
 #
-# T1w (MPRAGE) spinal cord & canal CSA pipeline.
+# STIR CPU phase: label parsing, registration, CSA, aSCOR, SPINEPS CSA, QC.
+#
+# This is the CPU half of the split pipeline. It expects GPU outputs to already
+# exist in the subject directory (from process_csa_stir_gpu.sh).
+#
+# Expected GPU outputs:
+#   ${file_stir}_step2_output.nii.gz           — multi-label segmentation
+#   ${file_stir}_step1_levels.nii.gz           — disc labels
+#   derivatives_seg/*_seg-spine*msk.nii.gz     — SPINEPS output (optional)
 #
 # Methods:
 #   1 — TotalSpineSeg  (cord + canal from DL segmentation)
-#   3 — Atlas41        (PAM50_atlas_41 = full canal template, warped to native space)
-#   4 — PAM50          (PAM50_cord+csf union warped to native; cord from TotalSpineSeg)
+#   2 — SPINEPS        (cord + canal from DL segmentation, if GPU output exists)
+#   3 — Atlas41        (PAM50_atlas_41 warped to native space)
+#   4 — PAM50          (PAM50_cord+csf union warped to native)
 #
-# Note: SPINEPS (Method 2) is excluded for T1w — its instance segmentation
-#       is unreliable on T1w data. SPINEPS is used for T2w and STIR only.
-#
-# Methods 3 & 4 run an interpolation ablation (nn, linear, spline) comparing
-# different warping strategies for probabilistic templates.
-#
-# Parallelization strategy:
-#   Phase 1: GPU segmentation (sct_deepseg — serial)
-#   Phase 2: Label parsing (process_seg + relabel_vertebrae — parallel)
-#   Phase 3: Two parallel branches:
-#     A — Method 1 (TotalSpineSeg) CSA
-#     B — Registration + Methods 3 & 4 (3 interpolation variants in parallel)
-#   ITK threads are capped to prevent oversubscription with sct_run_batch -jobs N.
-#   Override with: export ITK_THREADS=2 (before sct_run_batch).
-#
-# Note: T1w filenames vary (T1w vs T1w-CE) so this script discovers the file
-#       dynamically. Prefers non-CE T1w; falls back to T1w-CE if unavailable.
-#
-# Dependencies:
-#   - SCT >= 7.1
-#   - SPINEPS (pip install spineps) — optional
-#   - Python packages: nibabel, numpy
-#
-# Usage (via sct_run_batch):
-#   sct_run_batch -script process_csa_t1w.sh \
-#       -path-data <PATH-TO-T1W-DATASET> \
+# Usage (via sct_run_batch, called from run_pipeline.sh):
+#   sct_run_batch -script process_csa_stir_cpu.sh \
+#       -path-data <PATH-TO-GPU-OUTPUT/data_processed> \
 #       -path-output <PATH-TO-OUTPUT> \
 #       -jobs <N> \
 #       -script-args <PATH-TO-THIS-REPO>
@@ -58,44 +44,41 @@ sct_check_dependencies -short
 # PAM50 template directory (within SCT installation)
 PAM50_DIR="${SCT_DIR}/data/PAM50"
 
-# Go to processing folder
+# Go to processing folder — data already in place from GPU phase
 cd "${PATH_DATA_PROCESSED}"
-
-# Copy source images
-rsync -Ravzh "${PATH_DATA}/./${SUBJECT}" .
 file="${SUBJECT//[\/]/_}"
 
 cd "${SUBJECT}/anat/"
 
-# Dynamically discover the T1w file (prefer non-CE; fall back to T1w-CE)
-file_t1w_nii=$(ls *_T1w.nii.gz 2>/dev/null | head -1) || true
-if [[ -z "${file_t1w_nii}" ]]; then
-    file_t1w_nii=$(ls *_T1w-CE.nii.gz 2>/dev/null | head -1) || true
-fi
-if [[ -z "${file_t1w_nii}" ]]; then
-    echo "WARNING: No T1w file found for ${SUBJECT}. Skipping."
+# Dynamically discover the STIR file (naming varies across subjects)
+file_stir_nii=$(ls *_STIR.nii.gz 2>/dev/null | head -1) || true
+if [[ -z "${file_stir_nii}" ]]; then
+    echo "WARNING: No STIR file found for ${SUBJECT}. Skipping."
     exit 0
 fi
-file_t1w="${file_t1w_nii%.nii.gz}"
-echo "Found T1w file: ${file_t1w}"
+file_stir="${file_stir_nii%.nii.gz}"
+echo "Found STIR file: ${file_stir}"
 
-# ======================================================================
-# Phase 1: TotalSpineSeg Segmentation (GPU — serial)
-# ======================================================================
-sct_deepseg totalspineseg -i "${file_t1w}.nii.gz" -qc "${PATH_QC}"
+# Verify GPU outputs exist
+file_totalseg_all="${file_stir}_step2_output"
+file_totalseg_discs="${file_stir}_step1_levels"
 
-# Output products (SCT 7.1 naming: step1_* and step2_*)
-file_totalseg_all="${file_t1w}_step2_output"
-file_totalseg_discs="${file_t1w}_step1_levels"
+if [[ ! -f "${file_totalseg_all}.nii.gz" ]]; then
+    echo "ERROR: GPU output ${file_totalseg_all}.nii.gz not found for ${SUBJECT}. Run GPU phase first."
+    exit 1
+fi
+if [[ ! -f "${file_totalseg_discs}.nii.gz" ]]; then
+    echo "ERROR: GPU output ${file_totalseg_discs}.nii.gz not found for ${SUBJECT}. Run GPU phase first."
+    exit 1
+fi
 
 # ======================================================================
 # Phase 2: Parse TotalSpineSeg Labels (parallel)
 # ======================================================================
-# Naming: seg-<method>-<structure> for crystal-clear provenance
-file_tss_cord="${file_t1w}_seg-totalspineseg-cord"
-file_tss_canal="${file_t1w}_seg-totalspineseg-canal"
-file_tss_union="${file_t1w}_seg-totalspineseg-cord-canal-union"
-file_tss_vert="${file_t1w}_seg-totalspineseg-vertlevels"
+file_tss_cord="${file_stir}_seg-totalspineseg-cord"
+file_tss_canal="${file_stir}_seg-totalspineseg-canal"
+file_tss_union="${file_stir}_seg-totalspineseg-cord-canal-union"
+file_tss_vert="${file_stir}_seg-totalspineseg-vertlevels"
 
 python3 "${SCRIPT_DIR}/process_seg.py" \
     -i "${file_totalseg_all}.nii.gz" \
@@ -154,22 +137,19 @@ pid_branch_a=$!
         -i "${file_totalseg_discs}.nii.gz" \
         -o "${file_discs_filtered}.nii.gz"
 
-    sct_register_to_template -i "${file_t1w}.nii.gz" \
+    sct_register_to_template -i "${file_stir}.nii.gz" \
         -s "${file_tss_cord}.nii.gz" \
         -ldisc "${file_discs_filtered}.nii.gz" \
-        -c t1 -qc "${PATH_QC}"
+        -c t2 -qc "${PATH_QC}"
 
     # PAM50_levels are labels → always use nearest-neighbor
     sct_apply_transfo -i "${PAM50_DIR}/template/PAM50_levels.nii.gz" \
-        -d "${file_t1w}.nii.gz" \
+        -d "${file_stir}.nii.gz" \
         -w warp_template2anat.nii.gz \
         -x nn \
         -o PAM50_levels_warped_nn.nii.gz
 
-    # Pre-combine cord+CSF in template space (binary union) so that a single
-    # warp preserves boundary voxels. Warping separately and combining in
-    # native space loses voxels where cord=0.4 + csf=0.4 = 0.8 canal
-    # probability — both get zeroed by independent 0.5 thresholds.
+    # Pre-combine cord+CSF in template space (binary union)
     sct_maths -i "${PAM50_DIR}/template/PAM50_cord.nii.gz" \
         -add "${PAM50_DIR}/template/PAM50_csf.nii.gz" \
         -o PAM50_cord_csf_union_template.nii.gz
@@ -182,17 +162,15 @@ pid_branch_a=$!
         (
             echo ">>> Warping templates with interpolation: ${INTERP}"
 
-            # Warp 2 templates in parallel: cord+csf union, atlas41
-            # No need to warp PAM50_cord — we use TotalSpineSeg cord (native space)
             sct_apply_transfo -i PAM50_cord_csf_union_template.nii.gz \
-                -d "${file_t1w}.nii.gz" \
+                -d "${file_stir}.nii.gz" \
                 -w warp_template2anat.nii.gz \
                 -x "${INTERP}" \
                 -o "PAM50_canal_warped_${INTERP}.nii.gz" &
             pid_w1=$!
 
             sct_apply_transfo -i "${SCRIPT_DIR}/atlas/PAM50_atlas_41.nii.gz" \
-                -d "${file_t1w}.nii.gz" \
+                -d "${file_stir}.nii.gz" \
                 -w warp_template2anat.nii.gz \
                 -x "${INTERP}" \
                 -o "PAM50_atlas41_warped_${INTERP}.nii.gz" &
@@ -201,7 +179,6 @@ pid_branch_a=$!
             wait $pid_w1
             wait $pid_w2
 
-            # Binarize warped templates in parallel
             sct_maths -i "PAM50_canal_warped_${INTERP}.nii.gz" -bin 0.5 \
                 -o "PAM50_canal_warped_${INTERP}_bin.nii.gz" &
             pid_b1=$!
@@ -213,10 +190,7 @@ pid_branch_a=$!
             wait $pid_b1
             wait $pid_b2
 
-            # Post-process canal mask:
-            # 1. Ensure canal ⊇ cord (warping can lose boundary voxels)
-            # 2. Fill holes (spline interpolation creates gaps in the CSF ring)
-            # Both are needed for clean QC contours and correct aSCOR.
+            # Post-process canal mask: union with cord + fill holes
             sct_maths -i "PAM50_canal_warped_${INTERP}_bin.nii.gz" \
                 -add "${file_tss_cord}.nii.gz" \
                 -o "PAM50_canal_warped_${INTERP}_bin.nii.gz"
@@ -238,7 +212,6 @@ nib.save(nib.Nifti1Image(d.astype(np.float32), img.affine, img.header), 'PAM50_c
 
             # Method 3 (Atlas41) and Method 4 (PAM50) in parallel
             (
-                # Method 3: Atlas41 — CSA + aSCOR
                 sct_process_segmentation -i "PAM50_atlas41_warped_${INTERP}_bin.nii.gz" \
                     -vertfile PAM50_levels_warped_nn.nii.gz \
                     -o "${PATH_RESULTS}/method-atlas41-warp-${INTERP}/${file}_canal.csv" -vert 1:25 -perlevel 1 &
@@ -273,8 +246,6 @@ nib.save(nib.Nifti1Image(d.astype(np.float32), img.affine, img.header), 'PAM50_c
             pid_m3=$!
 
             (
-                # Method 4: PAM50 — CSA + aSCOR
-                # Cord CSA uses TotalSpineSeg cord (native) — no need for warped PAM50 cord
                 sct_process_segmentation -i "PAM50_canal_warped_${INTERP}_bin.nii.gz" \
                     -vertfile PAM50_levels_warped_nn.nii.gz \
                     -o "${PATH_RESULTS}/method-pam50-warp-${INTERP}/${file}_canal.csv" -vert 1:25 -perlevel 1 &
@@ -319,17 +290,77 @@ nib.save(nib.Nifti1Image(d.astype(np.float32), img.affine, img.header), 'PAM50_c
 ) &
 pid_branch_b=$!
 
+# --- Branch C: SPINEPS CSA (CPU only — GPU segmentation already done) ---
+(
+    set +e
+    # SPINEPS outputs to derivatives_seg/ — check if GPU phase produced them
+    file_spineps_spine=$(ls "$(dirname "${file_stir}")"/derivatives_seg/*_seg-spine*msk.nii.gz 2>/dev/null | head -1)
+
+    if [[ -n "${file_spineps_spine}" ]]; then
+        file_spineps_spine="${file_spineps_spine%.nii.gz}"
+        file_spi_cord="${file_stir}_seg-spineps-cord"
+        file_spi_canal="${file_stir}_seg-spineps-canal"
+        file_spi_union="${file_stir}_seg-spineps-cord-canal-union"
+
+        python3 "${SCRIPT_DIR}/process_spineps_seg.py" \
+            -i "${file_spineps_spine}.nii.gz" \
+            --cord "${file_spi_cord}.nii.gz" \
+            --canal "${file_spi_canal}.nii.gz" \
+            --combined "${file_spi_union}.nii.gz"
+
+        mkdir -p "${PATH_RESULTS}/method-spineps"
+
+        sct_process_segmentation -i "${file_spi_cord}.nii.gz" \
+            -vertfile "${file_tss_vert}.nii.gz" \
+            -o "${PATH_RESULTS}/method-spineps/${file}_cord.csv" -vert 1:25 -perlevel 1 &
+        pid_s1=$!
+
+        sct_process_segmentation -i "${file_spi_union}.nii.gz" \
+            -vertfile "${file_tss_vert}.nii.gz" \
+            -o "${PATH_RESULTS}/method-spineps/${file}_canal.csv" -vert 1:25 -perlevel 1 &
+        pid_s2=$!
+
+        sct_process_segmentation -i "${file_spi_canal}.nii.gz" \
+            -vertfile "${file_tss_vert}.nii.gz" \
+            -o "${file_spi_canal}_csa.csv" -vert 1:25 -perlevel 1 &
+        pid_s3=$!
+
+        wait $pid_s1
+        wait $pid_s2
+        wait $pid_s3
+
+        python3 "${SCRIPT_DIR}/compute_ascor.py" \
+            --cord-csa "${PATH_RESULTS}/method-spineps/${file}_cord.csv" \
+            --canal-csa "${file_spi_canal}_csa.csv" \
+            -o "${PATH_RESULTS}/method-spineps/${file}_ratio.csv"
+    else
+        echo "INFO: No SPINEPS GPU output found. Skipping Method 2 (SPINEPS)."
+    fi
+) &
+pid_branch_c=$!
+
 # Wait for all parallel branches to complete
 wait $pid_branch_a
 wait $pid_branch_b
+wait $pid_branch_c || echo "WARNING: SPINEPS branch failed (non-critical). Continuing."
 
 # ======================================================================
 # QC: Custom overlay comparing all methods (uses spline = best quality)
 # ======================================================================
 mkdir -p "${PATH_QC}/custom_overlays"
 
+# Build SPINEPS args if available
+SPINEPS_QC_ARGS=""
+for spi_cord_candidate in "${file_stir}_seg-spineps-cord.nii.gz" "${file_stir/_STIR/_T2}_seg-spineps-cord.nii.gz"; do
+    if [[ -f "${spi_cord_candidate}" ]]; then
+        spi_union_candidate="${spi_cord_candidate/-cord/-cord-canal-union}"
+        SPINEPS_QC_ARGS="--spineps-cord ${spi_cord_candidate} --spineps-canal ${spi_union_candidate}"
+        break
+    fi
+done
+
 python3 "${SCRIPT_DIR}/generate_qc.py" \
-    -i "${file_t1w}.nii.gz" \
+    -i "${file_stir}.nii.gz" \
     --vertfile "${file_tss_vert}.nii.gz" \
     --totalspineseg-cord "${file_tss_cord}.nii.gz" \
     --totalspineseg-canal "${file_tss_union}.nii.gz" \
@@ -337,8 +368,9 @@ python3 "${SCRIPT_DIR}/generate_qc.py" \
     --custom-atlas-canal "PAM50_atlas41_warped_spline_bin.nii.gz" \
     --pam50-cord "${file_tss_cord}.nii.gz" \
     --pam50-canal "PAM50_canal_warped_spline_bin.nii.gz" \
+    ${SPINEPS_QC_ARGS} \
     -o "${PATH_QC}/custom_overlays/${file}_qc.png" \
-    --title "${file} — T1w"
+    --title "${file} — STIR"
 
 # ======================================================================
 # Done
@@ -347,6 +379,7 @@ end=$(date +%s)
 runtime=$((end - start))
 echo
 echo "~~~"
+echo "CPU phase complete for ${SUBJECT}"
 echo "SCT version: $(sct_version)"
 echo "Ran on:      $(uname -nsr)"
 echo "Duration:    $(($runtime / 3600))hrs $((($runtime / 60) % 60))min $(($runtime % 60))sec"

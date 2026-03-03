@@ -1,38 +1,22 @@
 #!/bin/bash
 #
-# T1w (MPRAGE) spinal cord & canal CSA pipeline.
+# T1w CPU phase: label parsing, registration, CSA, aSCOR, QC.
+#
+# This is the CPU half of the split pipeline. It expects GPU outputs to already
+# exist in the subject directory (from process_csa_t1w_gpu.sh).
+#
+# Expected GPU outputs:
+#   ${file_t1w}_step2_output.nii.gz  — multi-label segmentation
+#   ${file_t1w}_step1_levels.nii.gz  — disc labels
 #
 # Methods:
 #   1 — TotalSpineSeg  (cord + canal from DL segmentation)
-#   3 — Atlas41        (PAM50_atlas_41 = full canal template, warped to native space)
-#   4 — PAM50          (PAM50_cord+csf union warped to native; cord from TotalSpineSeg)
+#   3 — Atlas41        (PAM50_atlas_41 warped to native space)
+#   4 — PAM50          (PAM50_cord+csf union warped to native)
 #
-# Note: SPINEPS (Method 2) is excluded for T1w — its instance segmentation
-#       is unreliable on T1w data. SPINEPS is used for T2w and STIR only.
-#
-# Methods 3 & 4 run an interpolation ablation (nn, linear, spline) comparing
-# different warping strategies for probabilistic templates.
-#
-# Parallelization strategy:
-#   Phase 1: GPU segmentation (sct_deepseg — serial)
-#   Phase 2: Label parsing (process_seg + relabel_vertebrae — parallel)
-#   Phase 3: Two parallel branches:
-#     A — Method 1 (TotalSpineSeg) CSA
-#     B — Registration + Methods 3 & 4 (3 interpolation variants in parallel)
-#   ITK threads are capped to prevent oversubscription with sct_run_batch -jobs N.
-#   Override with: export ITK_THREADS=2 (before sct_run_batch).
-#
-# Note: T1w filenames vary (T1w vs T1w-CE) so this script discovers the file
-#       dynamically. Prefers non-CE T1w; falls back to T1w-CE if unavailable.
-#
-# Dependencies:
-#   - SCT >= 7.1
-#   - SPINEPS (pip install spineps) — optional
-#   - Python packages: nibabel, numpy
-#
-# Usage (via sct_run_batch):
-#   sct_run_batch -script process_csa_t1w.sh \
-#       -path-data <PATH-TO-T1W-DATASET> \
+# Usage (via sct_run_batch, called from run_pipeline.sh):
+#   sct_run_batch -script process_csa_t1w_cpu.sh \
+#       -path-data <PATH-TO-GPU-OUTPUT/data_processed> \
 #       -path-output <PATH-TO-OUTPUT> \
 #       -jobs <N> \
 #       -script-args <PATH-TO-THIS-REPO>
@@ -58,11 +42,8 @@ sct_check_dependencies -short
 # PAM50 template directory (within SCT installation)
 PAM50_DIR="${SCT_DIR}/data/PAM50"
 
-# Go to processing folder
+# Go to processing folder — data already in place from GPU phase
 cd "${PATH_DATA_PROCESSED}"
-
-# Copy source images
-rsync -Ravzh "${PATH_DATA}/./${SUBJECT}" .
 file="${SUBJECT//[\/]/_}"
 
 cd "${SUBJECT}/anat/"
@@ -79,19 +60,22 @@ fi
 file_t1w="${file_t1w_nii%.nii.gz}"
 echo "Found T1w file: ${file_t1w}"
 
-# ======================================================================
-# Phase 1: TotalSpineSeg Segmentation (GPU — serial)
-# ======================================================================
-sct_deepseg totalspineseg -i "${file_t1w}.nii.gz" -qc "${PATH_QC}"
-
-# Output products (SCT 7.1 naming: step1_* and step2_*)
+# Verify GPU outputs exist
 file_totalseg_all="${file_t1w}_step2_output"
 file_totalseg_discs="${file_t1w}_step1_levels"
+
+if [[ ! -f "${file_totalseg_all}.nii.gz" ]]; then
+    echo "ERROR: GPU output ${file_totalseg_all}.nii.gz not found for ${SUBJECT}. Run GPU phase first."
+    exit 1
+fi
+if [[ ! -f "${file_totalseg_discs}.nii.gz" ]]; then
+    echo "ERROR: GPU output ${file_totalseg_discs}.nii.gz not found for ${SUBJECT}. Run GPU phase first."
+    exit 1
+fi
 
 # ======================================================================
 # Phase 2: Parse TotalSpineSeg Labels (parallel)
 # ======================================================================
-# Naming: seg-<method>-<structure> for crystal-clear provenance
 file_tss_cord="${file_t1w}_seg-totalspineseg-cord"
 file_tss_canal="${file_t1w}_seg-totalspineseg-canal"
 file_tss_union="${file_t1w}_seg-totalspineseg-cord-canal-union"
@@ -166,10 +150,7 @@ pid_branch_a=$!
         -x nn \
         -o PAM50_levels_warped_nn.nii.gz
 
-    # Pre-combine cord+CSF in template space (binary union) so that a single
-    # warp preserves boundary voxels. Warping separately and combining in
-    # native space loses voxels where cord=0.4 + csf=0.4 = 0.8 canal
-    # probability — both get zeroed by independent 0.5 thresholds.
+    # Pre-combine cord+CSF in template space (binary union)
     sct_maths -i "${PAM50_DIR}/template/PAM50_cord.nii.gz" \
         -add "${PAM50_DIR}/template/PAM50_csf.nii.gz" \
         -o PAM50_cord_csf_union_template.nii.gz
@@ -182,8 +163,6 @@ pid_branch_a=$!
         (
             echo ">>> Warping templates with interpolation: ${INTERP}"
 
-            # Warp 2 templates in parallel: cord+csf union, atlas41
-            # No need to warp PAM50_cord — we use TotalSpineSeg cord (native space)
             sct_apply_transfo -i PAM50_cord_csf_union_template.nii.gz \
                 -d "${file_t1w}.nii.gz" \
                 -w warp_template2anat.nii.gz \
@@ -201,7 +180,6 @@ pid_branch_a=$!
             wait $pid_w1
             wait $pid_w2
 
-            # Binarize warped templates in parallel
             sct_maths -i "PAM50_canal_warped_${INTERP}.nii.gz" -bin 0.5 \
                 -o "PAM50_canal_warped_${INTERP}_bin.nii.gz" &
             pid_b1=$!
@@ -213,10 +191,7 @@ pid_branch_a=$!
             wait $pid_b1
             wait $pid_b2
 
-            # Post-process canal mask:
-            # 1. Ensure canal ⊇ cord (warping can lose boundary voxels)
-            # 2. Fill holes (spline interpolation creates gaps in the CSF ring)
-            # Both are needed for clean QC contours and correct aSCOR.
+            # Post-process canal mask: union with cord + fill holes
             sct_maths -i "PAM50_canal_warped_${INTERP}_bin.nii.gz" \
                 -add "${file_tss_cord}.nii.gz" \
                 -o "PAM50_canal_warped_${INTERP}_bin.nii.gz"
@@ -238,7 +213,6 @@ nib.save(nib.Nifti1Image(d.astype(np.float32), img.affine, img.header), 'PAM50_c
 
             # Method 3 (Atlas41) and Method 4 (PAM50) in parallel
             (
-                # Method 3: Atlas41 — CSA + aSCOR
                 sct_process_segmentation -i "PAM50_atlas41_warped_${INTERP}_bin.nii.gz" \
                     -vertfile PAM50_levels_warped_nn.nii.gz \
                     -o "${PATH_RESULTS}/method-atlas41-warp-${INTERP}/${file}_canal.csv" -vert 1:25 -perlevel 1 &
@@ -273,8 +247,6 @@ nib.save(nib.Nifti1Image(d.astype(np.float32), img.affine, img.header), 'PAM50_c
             pid_m3=$!
 
             (
-                # Method 4: PAM50 — CSA + aSCOR
-                # Cord CSA uses TotalSpineSeg cord (native) — no need for warped PAM50 cord
                 sct_process_segmentation -i "PAM50_canal_warped_${INTERP}_bin.nii.gz" \
                     -vertfile PAM50_levels_warped_nn.nii.gz \
                     -o "${PATH_RESULTS}/method-pam50-warp-${INTERP}/${file}_canal.csv" -vert 1:25 -perlevel 1 &
@@ -347,6 +319,7 @@ end=$(date +%s)
 runtime=$((end - start))
 echo
 echo "~~~"
+echo "CPU phase complete for ${SUBJECT}"
 echo "SCT version: $(sct_version)"
 echo "Ran on:      $(uname -nsr)"
 echo "Duration:    $(($runtime / 3600))hrs $((($runtime / 60) % 60))min $(($runtime % 60))sec"
