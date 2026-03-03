@@ -11,12 +11,10 @@ pip install -r requirements.txt
 # https://github.com/neuroradiologyVH/Spinal-Cord-Canal-Template
 mkdir -p atlas/  # place PAM50_atlas_41.nii.gz here
 
-./run_pipeline.sh \
-    -t1w-data  ~/data/mms_T1w-MPRAGE_selected \
-    -t2w-data  ~/data/mms_acq-sag_T2w-STIR_desc-sc_qced_filtered \
-    -stir-data ~/data/mms_acq-sag_T2w-STIR_desc-sc_qced_filtered \
-    -output ~/output/csa_results \
-    -jobs-gpu 4 -jobs-cpu 16
+# Run once per contrast:
+./run_pipeline.sh -path-data ~/data/mms_T1w-MPRAGE_selected -contrast t1w -output ~/output/t1w
+./run_pipeline.sh -path-data ~/data/mms_acq-sag_T2w-STIR -contrast t2w  -output ~/output/t2w
+./run_pipeline.sh -path-data ~/data/mms_acq-sag_T2w-STIR -contrast stir -output ~/output/stir
 ```
 
 T2w and STIR can point to the **same BIDS directory** -- scripts discover files by suffix (`*_T2w.nii.gz` / `*_STIR.nii.gz`) and skip sessions that lack the expected contrast.
@@ -51,15 +49,14 @@ Methods 3 & 4 run an **interpolation ablation** (nn, linear, spline) when warpin
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-t1w-data` | Path to T1w BIDS dataset | *(optional)* |
-| `-t2w-data` | Path to T2w BIDS dataset | *(optional)* |
-| `-stir-data` | Path to STIR BIDS dataset | *(optional)* |
-| `-output` | Base output directory | **required** |
+| `-path-data` | Path to BIDS dataset | **required** |
+| `-contrast` | Contrast to process (`t1w`, `t2w`, or `stir`) | **required** |
+| `-output` | Output directory | **required** |
 | `-jobs-gpu` | Parallel GPU segmentation jobs | 4 |
 | `-jobs-cpu` | Parallel CPU processing jobs | nproc/4 |
 | `-include-list` | File with one subject ID per line | *(all)* |
 
-At least one contrast data path is required. Override ITK threads with `export ITK_THREADS=2` before launching.
+Run once per contrast. Override ITK threads with `export ITK_THREADS=2` before launching.
 
 ### Standalone (single subject debugging)
 
@@ -74,20 +71,18 @@ First arg to `-script-args` is the contrast (`t1w`, `t2w`, or `stir`).
 ### Aggregate results
 
 ```bash
-python3 parse_results.py --directory /path/to/output/t2w/results --info "MEAN(area)"
+python3 parse_results.py --directory /path/to/output/results --info "MEAN(area)"
 ```
 
 ## Architecture
 
 ```
-run_pipeline.sh (orchestrator)
+run_pipeline.sh -contrast <t1w|t2w|stir> (orchestrator, one contrast per run)
 |
 +-- Phase 1: GPU segmentation (-jobs-gpu N)
-|   for each contrast in {t1w, t2w, stir}:
 |     process_csa_gpu.sh <contrast>  -> rsync + sct_deepseg (+ SPINEPS for t2w)
 |
 +-- Phase 2: CPU processing (-jobs-cpu N)
-    for each contrast in {t1w, t2w, stir}:
       process_csa_cpu.sh <contrast>  -> labels, registration, CSA, aSCOR, QC
 ```
 
@@ -105,7 +100,7 @@ SCT also generates its own HTML QC reports in `qc/` for `sct_deepseg` and `sct_r
 ## Output
 
 ```
-<output>/<contrast>/
+<output>/
 +-- results/
 |   +-- method-totalspineseg/          # *_cord.csv, *_canal.csv, *_ratio.csv
 |   +-- method-spineps/                # T2w only
