@@ -233,6 +233,8 @@ def main():
                         help="Output PNG path.")
     parser.add_argument("--title", default="",
                         help="Figure title.")
+    parser.add_argument("--interp", default=None,
+                        help="Interpolation method shown in title.")
 
     for method in ["totalspineseg", "spineps", "custom-atlas", "pam50"]:
         parser.add_argument(f"--{method}-cord", default=None,
@@ -251,12 +253,16 @@ def main():
         if cord_path or canal_path:
             method_files[method] = {"cord": cord_path, "canal": canal_path}
 
+    title = args.title
+    if args.interp:
+        title += f" (interp: {args.interp})"
+
     generate_qc_figure(
         native_path=args.image,
         method_files=method_files,
         output_path=args.output,
         vertfile_path=args.vertfile,
-        title=args.title,
+        title=title,
     )
 
 

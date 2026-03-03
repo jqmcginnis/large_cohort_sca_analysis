@@ -1,27 +1,31 @@
 #!/bin/bash
 #
-# STIR CPU phase: label parsing, registration, CSA, aSCOR, SPINEPS CSA, QC.
+# Unified CPU phase: label parsing, registration, CSA, aSCOR, QC.
+#
+# Parameterized by contrast — handles T1w, T2w, and STIR in a single script.
 #
 # This is the CPU half of the split pipeline. It expects GPU outputs to already
-# exist in the subject directory (from process_csa_stir_gpu.sh).
+# exist in the subject directory (from process_csa_gpu.sh).
 #
 # Expected GPU outputs:
-#   ${file_stir}_step2_output.nii.gz           — multi-label segmentation
-#   ${file_stir}_step1_levels.nii.gz           — disc labels
-#   derivatives_seg/*_seg-spine*msk.nii.gz     — SPINEPS output (optional)
+#   ${file}_step2_output.nii.gz           — multi-label segmentation
+#   ${file}_step1_levels.nii.gz           — disc labels
+#   derivatives_seg/*_seg-spine*msk.nii.gz — SPINEPS output (T2w only, optional)
 #
 # Methods:
 #   1 — TotalSpineSeg  (cord + canal from DL segmentation)
-#   2 — SPINEPS        (cord + canal from DL segmentation, if GPU output exists)
+#   2 — SPINEPS        (cord + canal from DL segmentation, T2w only)
 #   3 — Atlas41        (PAM50_atlas_41 warped to native space)
 #   4 — PAM50          (PAM50_cord+csf union warped to native)
 #
 # Usage (via sct_run_batch, called from run_pipeline.sh):
-#   sct_run_batch -script process_csa_stir_cpu.sh \
+#   sct_run_batch -script process_csa_cpu.sh \
 #       -path-data <PATH-TO-GPU-OUTPUT/data_processed> \
 #       -path-output <PATH-TO-OUTPUT> \
 #       -jobs <N> \
-#       -script-args <PATH-TO-THIS-REPO>
+#       -script-args "<CONTRAST> <PATH-TO-THIS-REPO>"
+#
+#   CONTRAST: t1w, t2w, or stir
 
 # BASH SETTINGS
 set -x
@@ -33,7 +37,8 @@ export ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS="${ITK_THREADS:-4}"
 
 # Retrieve input params
 SUBJECT=$1
-SCRIPT_DIR=$2
+CONTRAST=$2
+SCRIPT_DIR=$3
 
 # Timing
 start=$(date +%s)
@@ -50,18 +55,48 @@ file="${SUBJECT//[\/]/_}"
 
 cd "${SUBJECT}/anat/"
 
-# Dynamically discover the STIR file (naming varies across subjects)
-file_stir_nii=$(ls *_STIR.nii.gz 2>/dev/null | head -1) || true
-if [[ -z "${file_stir_nii}" ]]; then
-    echo "WARNING: No STIR file found for ${SUBJECT}. Skipping."
+# ======================================================================
+# File discovery (contrast-dependent)
+# ======================================================================
+file_nii=""
+case "$CONTRAST" in
+    t1w)
+        file_nii=$(ls *_T1w.nii.gz 2>/dev/null | head -1) || true
+        if [[ -z "$file_nii" ]]; then
+            file_nii=$(ls *_T1w-CE.nii.gz 2>/dev/null | head -1) || true
+        fi
+        ;;
+    t2w)
+        file_nii=$(ls *_T2w.nii.gz 2>/dev/null | head -1) || true
+        ;;
+    stir)
+        file_nii=$(ls *_STIR.nii.gz 2>/dev/null | head -1) || true
+        ;;
+    *)
+        echo "ERROR: Unknown contrast '${CONTRAST}'. Expected: t1w, t2w, or stir."
+        exit 1
+        ;;
+esac
+
+if [[ -z "$file_nii" ]]; then
+    echo "WARNING: No ${CONTRAST} file found for ${SUBJECT}. Skipping."
     exit 0
 fi
-file_stir="${file_stir_nii%.nii.gz}"
-echo "Found STIR file: ${file_stir}"
+file_base="${file_nii%.nii.gz}"
+echo "Found ${CONTRAST} file: ${file_base}"
+
+# Registration contrast flag
+case "$CONTRAST" in
+    t1w) REG_CONTRAST="t1" ;;
+    *)   REG_CONTRAST="t2" ;;
+esac
+
+# QC title
+CONTRAST_UPPER=$(echo "$CONTRAST" | tr '[:lower:]' '[:upper:]')
 
 # Verify GPU outputs exist
-file_totalseg_all="${file_stir}_step2_output"
-file_totalseg_discs="${file_stir}_step1_levels"
+file_totalseg_all="${file_base}_step2_output"
+file_totalseg_discs="${file_base}_step1_levels"
 
 if [[ ! -f "${file_totalseg_all}.nii.gz" ]]; then
     echo "ERROR: GPU output ${file_totalseg_all}.nii.gz not found for ${SUBJECT}. Run GPU phase first."
@@ -75,10 +110,10 @@ fi
 # ======================================================================
 # Phase 2: Parse TotalSpineSeg Labels (parallel)
 # ======================================================================
-file_tss_cord="${file_stir}_seg-totalspineseg-cord"
-file_tss_canal="${file_stir}_seg-totalspineseg-canal"
-file_tss_union="${file_stir}_seg-totalspineseg-cord-canal-union"
-file_tss_vert="${file_stir}_seg-totalspineseg-vertlevels"
+file_tss_cord="${file_base}_seg-totalspineseg-cord"
+file_tss_canal="${file_base}_seg-totalspineseg-canal"
+file_tss_union="${file_base}_seg-totalspineseg-cord-canal-union"
+file_tss_vert="${file_base}_seg-totalspineseg-vertlevels"
 
 python3 "${SCRIPT_DIR}/process_seg.py" \
     -i "${file_totalseg_all}.nii.gz" \
@@ -137,14 +172,14 @@ pid_branch_a=$!
         -i "${file_totalseg_discs}.nii.gz" \
         -o "${file_discs_filtered}.nii.gz"
 
-    sct_register_to_template -i "${file_stir}.nii.gz" \
+    sct_register_to_template -i "${file_base}.nii.gz" \
         -s "${file_tss_cord}.nii.gz" \
         -ldisc "${file_discs_filtered}.nii.gz" \
-        -c t2 -qc "${PATH_QC}"
+        -c "$REG_CONTRAST" -qc "${PATH_QC}"
 
     # PAM50_levels are labels → always use nearest-neighbor
     sct_apply_transfo -i "${PAM50_DIR}/template/PAM50_levels.nii.gz" \
-        -d "${file_stir}.nii.gz" \
+        -d "${file_base}.nii.gz" \
         -w warp_template2anat.nii.gz \
         -x nn \
         -o PAM50_levels_warped_nn.nii.gz
@@ -163,14 +198,14 @@ pid_branch_a=$!
             echo ">>> Warping templates with interpolation: ${INTERP}"
 
             sct_apply_transfo -i PAM50_cord_csf_union_template.nii.gz \
-                -d "${file_stir}.nii.gz" \
+                -d "${file_base}.nii.gz" \
                 -w warp_template2anat.nii.gz \
                 -x "${INTERP}" \
                 -o "PAM50_canal_warped_${INTERP}.nii.gz" &
             pid_w1=$!
 
             sct_apply_transfo -i "${SCRIPT_DIR}/atlas/PAM50_atlas_41.nii.gz" \
-                -d "${file_stir}.nii.gz" \
+                -d "${file_base}.nii.gz" \
                 -w warp_template2anat.nii.gz \
                 -x "${INTERP}" \
                 -o "PAM50_atlas41_warped_${INTERP}.nii.gz" &
@@ -196,15 +231,9 @@ pid_branch_a=$!
                 -o "PAM50_canal_warped_${INTERP}_bin.nii.gz"
             sct_maths -i "PAM50_canal_warped_${INTERP}_bin.nii.gz" -bin 0.5 \
                 -o "PAM50_canal_warped_${INTERP}_bin.nii.gz"
-            python3 -c "
-import nibabel as nib, numpy as np
-from scipy.ndimage import binary_fill_holes
-img = nib.load('PAM50_canal_warped_${INTERP}_bin.nii.gz')
-d = img.get_fdata()
-for z in range(d.shape[2]):
-    d[:,:,z] = binary_fill_holes(d[:,:,z])
-nib.save(nib.Nifti1Image(d.astype(np.float32), img.affine, img.header), 'PAM50_canal_warped_${INTERP}_bin.nii.gz')
-"
+            python3 "${SCRIPT_DIR}/fill_canal_holes.py" \
+                -i "PAM50_canal_warped_${INTERP}_bin.nii.gz" \
+                -o "PAM50_canal_warped_${INTERP}_bin.nii.gz"
 
             # Create result directories
             mkdir -p "${PATH_RESULTS}/method-atlas41-warp-${INTERP}"
@@ -290,77 +319,77 @@ nib.save(nib.Nifti1Image(d.astype(np.float32), img.affine, img.header), 'PAM50_c
 ) &
 pid_branch_b=$!
 
-# --- Branch C: SPINEPS CSA (CPU only — GPU segmentation already done) ---
-(
-    set +e
-    # SPINEPS outputs to derivatives_seg/ — check if GPU phase produced them
-    file_spineps_spine=$(ls "$(dirname "${file_stir}")"/derivatives_seg/*_seg-spine*msk.nii.gz 2>/dev/null | head -1)
+# --- Branch C: SPINEPS CSA (T2w only — GPU segmentation already done) ---
+if [[ "$CONTRAST" == "t2w" ]]; then
+    (
+        set +e
+        # SPINEPS outputs to derivatives_seg/ — check if GPU phase produced them
+        file_spineps_spine=$(ls "$(dirname "${file_base}")"/derivatives_seg/*_seg-spine*msk.nii.gz 2>/dev/null | head -1)
 
-    if [[ -n "${file_spineps_spine}" ]]; then
-        file_spineps_spine="${file_spineps_spine%.nii.gz}"
-        file_spi_cord="${file_stir}_seg-spineps-cord"
-        file_spi_canal="${file_stir}_seg-spineps-canal"
-        file_spi_union="${file_stir}_seg-spineps-cord-canal-union"
+        if [[ -n "${file_spineps_spine}" ]]; then
+            file_spineps_spine="${file_spineps_spine%.nii.gz}"
+            file_spi_cord="${file_base}_seg-spineps-cord"
+            file_spi_canal="${file_base}_seg-spineps-canal"
+            file_spi_union="${file_base}_seg-spineps-cord-canal-union"
 
-        python3 "${SCRIPT_DIR}/process_spineps_seg.py" \
-            -i "${file_spineps_spine}.nii.gz" \
-            --cord "${file_spi_cord}.nii.gz" \
-            --canal "${file_spi_canal}.nii.gz" \
-            --combined "${file_spi_union}.nii.gz"
+            python3 "${SCRIPT_DIR}/process_spineps_seg.py" \
+                -i "${file_spineps_spine}.nii.gz" \
+                --cord "${file_spi_cord}.nii.gz" \
+                --canal "${file_spi_canal}.nii.gz" \
+                --combined "${file_spi_union}.nii.gz"
 
-        mkdir -p "${PATH_RESULTS}/method-spineps"
+            mkdir -p "${PATH_RESULTS}/method-spineps"
 
-        sct_process_segmentation -i "${file_spi_cord}.nii.gz" \
-            -vertfile "${file_tss_vert}.nii.gz" \
-            -o "${PATH_RESULTS}/method-spineps/${file}_cord.csv" -vert 1:25 -perlevel 1 &
-        pid_s1=$!
+            sct_process_segmentation -i "${file_spi_cord}.nii.gz" \
+                -vertfile "${file_tss_vert}.nii.gz" \
+                -o "${PATH_RESULTS}/method-spineps/${file}_cord.csv" -vert 1:25 -perlevel 1 &
+            pid_s1=$!
 
-        sct_process_segmentation -i "${file_spi_union}.nii.gz" \
-            -vertfile "${file_tss_vert}.nii.gz" \
-            -o "${PATH_RESULTS}/method-spineps/${file}_canal.csv" -vert 1:25 -perlevel 1 &
-        pid_s2=$!
+            sct_process_segmentation -i "${file_spi_union}.nii.gz" \
+                -vertfile "${file_tss_vert}.nii.gz" \
+                -o "${PATH_RESULTS}/method-spineps/${file}_canal.csv" -vert 1:25 -perlevel 1 &
+            pid_s2=$!
 
-        sct_process_segmentation -i "${file_spi_canal}.nii.gz" \
-            -vertfile "${file_tss_vert}.nii.gz" \
-            -o "${file_spi_canal}_csa.csv" -vert 1:25 -perlevel 1 &
-        pid_s3=$!
+            sct_process_segmentation -i "${file_spi_canal}.nii.gz" \
+                -vertfile "${file_tss_vert}.nii.gz" \
+                -o "${file_spi_canal}_csa.csv" -vert 1:25 -perlevel 1 &
+            pid_s3=$!
 
-        wait $pid_s1
-        wait $pid_s2
-        wait $pid_s3
+            wait $pid_s1
+            wait $pid_s2
+            wait $pid_s3
 
-        python3 "${SCRIPT_DIR}/compute_ascor.py" \
-            --cord-csa "${PATH_RESULTS}/method-spineps/${file}_cord.csv" \
-            --canal-csa "${file_spi_canal}_csa.csv" \
-            -o "${PATH_RESULTS}/method-spineps/${file}_ratio.csv"
-    else
-        echo "INFO: No SPINEPS GPU output found. Skipping Method 2 (SPINEPS)."
-    fi
-) &
-pid_branch_c=$!
+            python3 "${SCRIPT_DIR}/compute_ascor.py" \
+                --cord-csa "${PATH_RESULTS}/method-spineps/${file}_cord.csv" \
+                --canal-csa "${file_spi_canal}_csa.csv" \
+                -o "${PATH_RESULTS}/method-spineps/${file}_ratio.csv"
+        else
+            echo "INFO: No SPINEPS GPU output found. Skipping Method 2 (SPINEPS)."
+        fi
+    ) &
+    pid_branch_c=$!
+fi
 
 # Wait for all parallel branches to complete
 wait $pid_branch_a
 wait $pid_branch_b
-wait $pid_branch_c || echo "WARNING: SPINEPS branch failed (non-critical). Continuing."
+if [[ "$CONTRAST" == "t2w" ]]; then
+    wait $pid_branch_c || echo "WARNING: SPINEPS branch failed (non-critical). Continuing."
+fi
 
 # ======================================================================
 # QC: Custom overlay comparing all methods (uses spline = best quality)
 # ======================================================================
 mkdir -p "${PATH_QC}/custom_overlays"
 
-# Build SPINEPS args if available
+# Build SPINEPS args if available (T2w only)
 SPINEPS_QC_ARGS=""
-for spi_cord_candidate in "${file_stir}_seg-spineps-cord.nii.gz" "${file_stir/_STIR/_T2}_seg-spineps-cord.nii.gz"; do
-    if [[ -f "${spi_cord_candidate}" ]]; then
-        spi_union_candidate="${spi_cord_candidate/-cord/-cord-canal-union}"
-        SPINEPS_QC_ARGS="--spineps-cord ${spi_cord_candidate} --spineps-canal ${spi_union_candidate}"
-        break
-    fi
-done
+if [[ "$CONTRAST" == "t2w" && -f "${file_base}_seg-spineps-cord.nii.gz" ]]; then
+    SPINEPS_QC_ARGS="--spineps-cord ${file_base}_seg-spineps-cord.nii.gz --spineps-canal ${file_base}_seg-spineps-cord-canal-union.nii.gz"
+fi
 
 python3 "${SCRIPT_DIR}/generate_qc.py" \
-    -i "${file_stir}.nii.gz" \
+    -i "${file_base}.nii.gz" \
     --vertfile "${file_tss_vert}.nii.gz" \
     --totalspineseg-cord "${file_tss_cord}.nii.gz" \
     --totalspineseg-canal "${file_tss_union}.nii.gz" \
@@ -370,7 +399,8 @@ python3 "${SCRIPT_DIR}/generate_qc.py" \
     --pam50-canal "PAM50_canal_warped_spline_bin.nii.gz" \
     ${SPINEPS_QC_ARGS} \
     -o "${PATH_QC}/custom_overlays/${file}_qc.png" \
-    --title "${file} — STIR"
+    --title "${file} — ${CONTRAST_UPPER}" \
+    --interp spline
 
 # ======================================================================
 # Done
@@ -379,7 +409,7 @@ end=$(date +%s)
 runtime=$((end - start))
 echo
 echo "~~~"
-echo "CPU phase complete for ${SUBJECT}"
+echo "CPU phase complete for ${SUBJECT} (${CONTRAST})"
 echo "SCT version: $(sct_version)"
 echo "Ran on:      $(uname -nsr)"
 echo "Duration:    $(($runtime / 3600))hrs $((($runtime / 60) % 60))min $(($runtime % 60))sec"

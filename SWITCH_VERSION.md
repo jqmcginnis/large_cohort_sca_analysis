@@ -5,7 +5,7 @@ apply the changes below to adopt the 7.2+ API.
 
 ## 1. Segmentation command
 
-**All 3 scripts** (`process_csa_t1w.sh`, `process_csa_t2w.sh`, `process_csa_stir.sh`):
+**All parameterized scripts** (`process_csa_gpu.sh`, `process_csa_cpu.sh`, `process_csa.sh`):
 
 ```diff
 - sct_deepseg totalspineseg -i "${file}.nii.gz" -qc "${PATH_QC}"
@@ -95,8 +95,8 @@ In each script header:
 
 ```bash
 # Run on one subject
-sct_run_batch -script process_csa_t1w.sh -path-data /path/to/data \
-    -path-output /tmp/test_7.3 -jobs 1 -script-args /path/to/repo \
+sct_run_batch -script process_csa.sh -path-data /path/to/data \
+    -path-output /tmp/test_7.3 -jobs 1 -script-args "t1w /path/to/repo" \
     -include "sub-XXXX"
 
 # Check: per-level output exists

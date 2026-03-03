@@ -20,8 +20,8 @@
 #
 # All three data paths are optional — omit any contrast to skip it.
 #
-# The original monolithic scripts (process_csa_t1w.sh, etc.) are preserved
-# for single-subject use via sct_run_batch.
+# The monolithic script (process_csa.sh) can be used for single-subject
+# standalone debugging via sct_run_batch.
 
 set -e -o pipefail
 trap "echo Caught Keyboard Interrupt. Exiting.; exit" INT
@@ -121,38 +121,21 @@ phase1_start=$(date +%s)
 # sct_run_batch exits non-zero if ANY subject fails, even though it continues
 # processing. We tolerate partial failures — the CPU phase skips subjects
 # whose GPU outputs are missing.
-if [[ -n "$T1W_DATA" ]]; then
-    echo "--- T1w GPU segmentation ---"
-    sct_run_batch -script "${SCRIPT_DIR}/process_csa_t1w_gpu.sh" \
-        -path-data "$T1W_DATA" \
-        -path-output "$OUTPUT/t1w" \
-        -jobs "$JOBS_GPU" \
-        ${INCLUDE_ARGS} \
-        -script-args "$SCRIPT_DIR" \
-    || echo "WARNING: Some T1w subjects failed GPU segmentation (see logs). Continuing."
-fi
+for CONTRAST_INFO in "t1w:$T1W_DATA" "t2w:$T2W_DATA" "stir:$STIR_DATA"; do
+    CONTRAST="${CONTRAST_INFO%%:*}"
+    DATA_PATH="${CONTRAST_INFO#*:}"
+    [[ -z "$DATA_PATH" ]] && continue
 
-if [[ -n "$T2W_DATA" ]]; then
-    echo "--- T2w GPU segmentation ---"
-    sct_run_batch -script "${SCRIPT_DIR}/process_csa_t2w_gpu.sh" \
-        -path-data "$T2W_DATA" \
-        -path-output "$OUTPUT/t2w" \
+    CONTRAST_UPPER=$(echo "$CONTRAST" | tr '[:lower:]' '[:upper:]')
+    echo "--- ${CONTRAST_UPPER} GPU segmentation ---"
+    sct_run_batch -script "${SCRIPT_DIR}/process_csa_gpu.sh" \
+        -path-data "$DATA_PATH" \
+        -path-output "$OUTPUT/$CONTRAST" \
         -jobs "$JOBS_GPU" \
         ${INCLUDE_ARGS} \
-        -script-args "$SCRIPT_DIR" \
-    || echo "WARNING: Some T2w subjects failed GPU segmentation (see logs). Continuing."
-fi
-
-if [[ -n "$STIR_DATA" ]]; then
-    echo "--- STIR GPU segmentation ---"
-    sct_run_batch -script "${SCRIPT_DIR}/process_csa_stir_gpu.sh" \
-        -path-data "$STIR_DATA" \
-        -path-output "$OUTPUT/stir" \
-        -jobs "$JOBS_GPU" \
-        ${INCLUDE_ARGS} \
-        -script-args "$SCRIPT_DIR" \
-    || echo "WARNING: Some STIR subjects failed GPU segmentation (see logs). Continuing."
-fi
+        -script-args "$CONTRAST $SCRIPT_DIR" \
+    || echo "WARNING: Some ${CONTRAST_UPPER} subjects failed GPU segmentation (see logs). Continuing."
+done
 
 phase1_end=$(date +%s)
 phase1_runtime=$((phase1_end - phase1_start))
@@ -168,53 +151,26 @@ echo "=== Phase 2: CPU Processing (jobs=${JOBS_CPU}) ==="
 echo "================================================================"
 phase2_start=$(date +%s)
 
-if [[ -n "$T1W_DATA" ]]; then
-    echo "--- T1w CPU processing ---"
-    sct_run_batch -script "${SCRIPT_DIR}/process_csa_t1w_cpu.sh" \
-        -path-data "$OUTPUT/t1w/data_processed" \
-        -path-output "$OUTPUT/t1w" \
+for CONTRAST_INFO in "t1w:$T1W_DATA" "t2w:$T2W_DATA" "stir:$STIR_DATA"; do
+    CONTRAST="${CONTRAST_INFO%%:*}"
+    DATA_PATH="${CONTRAST_INFO#*:}"
+    [[ -z "$DATA_PATH" ]] && continue
+
+    CONTRAST_UPPER=$(echo "$CONTRAST" | tr '[:lower:]' '[:upper:]')
+    echo "--- ${CONTRAST_UPPER} CPU processing ---"
+    sct_run_batch -script "${SCRIPT_DIR}/process_csa_cpu.sh" \
+        -path-data "$OUTPUT/$CONTRAST/data_processed" \
+        -path-output "$OUTPUT/$CONTRAST" \
         -jobs "$JOBS_CPU" \
         ${INCLUDE_ARGS} \
-        -script-args "$SCRIPT_DIR" \
-    || echo "WARNING: Some T1w subjects failed CPU processing (see logs). Continuing."
+        -script-args "$CONTRAST $SCRIPT_DIR" \
+    || echo "WARNING: Some ${CONTRAST_UPPER} subjects failed CPU processing (see logs). Continuing."
 
-    echo ">>> Aggregating T1w results..."
+    echo ">>> Aggregating ${CONTRAST_UPPER} results..."
     python3 "${SCRIPT_DIR}/parse_results.py" \
-        --directory "$OUTPUT/t1w/results" \
+        --directory "$OUTPUT/$CONTRAST/results" \
         --info "MEAN(area)" || true
-fi
-
-if [[ -n "$T2W_DATA" ]]; then
-    echo "--- T2w CPU processing ---"
-    sct_run_batch -script "${SCRIPT_DIR}/process_csa_t2w_cpu.sh" \
-        -path-data "$OUTPUT/t2w/data_processed" \
-        -path-output "$OUTPUT/t2w" \
-        -jobs "$JOBS_CPU" \
-        ${INCLUDE_ARGS} \
-        -script-args "$SCRIPT_DIR" \
-    || echo "WARNING: Some T2w subjects failed CPU processing (see logs). Continuing."
-
-    echo ">>> Aggregating T2w results..."
-    python3 "${SCRIPT_DIR}/parse_results.py" \
-        --directory "$OUTPUT/t2w/results" \
-        --info "MEAN(area)" || true
-fi
-
-if [[ -n "$STIR_DATA" ]]; then
-    echo "--- STIR CPU processing ---"
-    sct_run_batch -script "${SCRIPT_DIR}/process_csa_stir_cpu.sh" \
-        -path-data "$OUTPUT/stir/data_processed" \
-        -path-output "$OUTPUT/stir" \
-        -jobs "$JOBS_CPU" \
-        ${INCLUDE_ARGS} \
-        -script-args "$SCRIPT_DIR" \
-    || echo "WARNING: Some STIR subjects failed CPU processing (see logs). Continuing."
-
-    echo ">>> Aggregating STIR results..."
-    python3 "${SCRIPT_DIR}/parse_results.py" \
-        --directory "$OUTPUT/stir/results" \
-        --info "MEAN(area)" || true
-fi
+done
 
 phase2_end=$(date +%s)
 phase2_runtime=$((phase2_end - phase2_start))
